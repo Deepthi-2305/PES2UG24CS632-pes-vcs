@@ -82,7 +82,6 @@ int object_exists(const ObjectID *id) {
 
 // HINTS - Useful syscalls and functions for this phase:
 //   - sprintf / snprintf : formatting the header string
-//   - compute_hash       : hashing the combined header + data
 //   - object_exists      : checking for deduplication
 //   - mkdir              : creating the shard directory (use mode 0755)
 //   - open, write, close : creating and writing to the temp file
@@ -94,9 +93,56 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    char type_str[10];
+
+    if (type == OBJ_BLOB) strcpy(type_str, "blob");
+    else if (type == OBJ_TREE) strcpy(type_str, "tree");
+    else strcpy(type_str, "commit");
+
+    char header[64];
+    int header_len = sprintf(header, "%s %zu", type_str, len) + 1;
+
+    size_t total_len = header_len + len;
+    char *full_data = malloc(total_len);
+    if (!full_data) return -1;
+
+    memcpy(full_data, header, header_len);
+    memcpy(full_data + header_len, data, len);
+
+    compute_hash(full_data, total_len, id_out);
+
+    if (object_exists(id_out)) {
+        free(full_data);
+        return 0;
+    }
+
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+
+    char dir[512];
+    strncpy(dir, path, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    *slash = '\0';
+
+    mkdir(dir, 0755);
+
+    char temp[512];
+    snprintf(temp, sizeof(temp), "%s.tmp", path);
+
+    int fd = open(temp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(full_data);
+        return -1;
+    }
+
+    write(fd, full_data, total_len);
+    fsync(fd);
+    close(fd);
+
+    rename(temp, path);
+
+    free(full_data);
+    return 0;
 }
 
 // Read an object from the store.
@@ -122,7 +168,59 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    rewind(fp);
+
+    char *buffer = malloc(file_size);
+    if (!buffer) {
+        fclose(fp);
+        return -1;
+    }
+
+if (fread(buffer, 1, file_size, fp) != (size_t)file_size) {
+        free(buffer);
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+
+    /* Verify hash integrity */
+    ObjectID check;
+    compute_hash(buffer, file_size, &check);
+
+    if (memcmp(check.hash, id->hash, HASH_SIZE) != 0) {
+        free(buffer);
+        return -1;
+    }
+
+    char *space = strchr(buffer, ' ');
+    char *nullpos = memchr(buffer, '\0', file_size);
+
+    if (!space || !nullpos) {
+        free(buffer);
+        return -1;
+    }
+
+    *space = '\0';
+
+    if (strcmp(buffer, "blob") == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(buffer, "tree") == 0) *type_out = OBJ_TREE;
+    else *type_out = OBJ_COMMIT;
+
+    size_t len = atoi(space + 1);
+    *len_out = len;
+
+    *data_out = malloc(len);
+    memcpy(*data_out, nullpos + 1, len);
+
+    free(buffer);
+    return 0;
 }
